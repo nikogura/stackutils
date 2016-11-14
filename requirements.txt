@@ -1,0 +1,6 @@
+#--index-url https://pypi.company.com/simple
+
+
+python-novaclient==5.0.0
+python-glanceclient==2.3.0
+keystoneauth1=2.11.1

@@ -1,0 +1,1768 @@
+#!/usr/bin/env bash
+set -e
+
+# First Run bin/boxinit <fqdn>  This stages the repos and keys to the box
+# Then login to the box, and as root run ./boxinit  This installs the repos, upgrades everything and reboots
+
+CONTROLLER=controller.company.com
+AUTOMATION_USER=automation_user
+AUTOMATION_PROJECT=automation_project
+IPADDRESS=$(ip a | grep 'inet ' | grep -v 127.0.0.1 | cut -d ' ' -f 6 | cut -d '/' -f1 | sed -n 1p)
+DOMAIN=company.com
+MGMT_INTERFACE='eth0'
+PUBLIC_INTERFACE='eth1'
+IMAGEREPO='http://cloud.centos.org/centos/7/images/'
+PUBLIC_NETWORK='10.0.0.0/8'
+PUBLIC_GATEWAY='10.0.0.1'
+PUBLIC_ROUTER_IP='10.0.0.2'
+PUBLIC_NAMESERVER='8.8.8.8'
+#PUBLIC_IP_START='10.0.0.5'
+#PUBLIC_IP_END='10.0.0.10'
+PRIVATE_NETWORK='192.168.3.0/24'
+PRIVATE_GATEWAY='192.168.3.1'
+PRIVATE_START_IP='192.168.3.2'
+PRIVATE_END_IP='192.168.3.100'
+#VIRTTYPE='qemu'        # only used for Openstack On Openstack
+VIRTTYPE='kvm'
+DHCP_DOMAIN='company.com'
+
+declare -a PASSKEYS=(
+DATABASE_PASS 
+ADMIN_TOKEN 
+ADMIN_PASS 
+GLANCE_DBPASS 
+GLANCE_PASS 
+KEYSTONE_DBPASS 
+NEUTRON_DBPASS 
+NEUTRON_PASS 
+NOVA_DBPASS 
+NOVA_PASS 
+RABBIT_PASS 
+METADATA_SECRET
+AUTOMATION_PASS
+)
+
+declare -A IMAGES=(
+    ['CentOS-7-x86_64-GenericCloud-1608']='CentOS-7-x86_64-GenericCloud-1608.qcow2'
+)
+
+# PASSWORDS
+
+for key in ${PASSKEYS[@]}; do
+    if [ -z ${!key} ]; then
+        echo "No passwords found.  Generating them now and exiting.  Run this script again to actually install OpenStack."
+
+        declare -A SECRETS
+
+        for i in ${PASSKEYS[@]}; do
+            SECRETS[$i]=$(openssl rand -hex 10)
+        done
+
+        for i in "${!SECRETS[@]}"; do
+          #echo "$i => ${SECRETS[$i]}"
+          sed -i  "/^# PASSWORDS/a $i=${SECRETS[$i]}
+            " $0
+        done
+
+        exit 0
+    fi
+done
+
+echo "Have Passwords.  Installing OpenStack"
+
+OSINFO=$(grep NAME /etc/os-release)
+
+if [[ "$OSINFO" =~ "CentOS" ]]; then
+  echo "Installing on CentOS"
+  #yum install -y centos-release-openstack-liberty
+else
+    echo "Installing on RHEL or OEL.  Disabling IPTables"
+    systemctl disable iptables
+    systemctl stop iptables
+    # installing this first pins versions at something we can handle.
+    yum install -y libxslt-1.1.28-5.el7
+    #yum install -y https://rdoproject.org/repos/openstack-liberty/rdo-release-liberty.rpm
+fi
+
+#munge controller name into /etc/hosts
+sed -i "/^127.0.0.1/ s/$/ $CONTROLLER/" /etc/hosts
+
+echo "Installing Packages"
+yum install -y python-openstackclient
+yum install -y openstack-selinux
+
+echo "Installing OpenStack Database"
+yum install -y mariadb mariadb-server MySQL-python
+
+echo "Installing Keystone Packages"
+yum install -y openstack-keystone httpd mod_wsgi memcached python-memcached
+
+echo "Installing Glance Packages"
+yum install -y openstack-glance python-glance python-glanceclient
+
+echo "Installing Nova Packages"
+yum install -y openstack-nova-api openstack-nova-cert openstack-nova-conductor openstack-nova-console openstack-nova-novncproxy openstack-nova-scheduler python-novaclient openstack-nova-compute sysfsutils
+
+echo "Installing Neutron Packages"
+yum install -y openstack-neutron openstack-neutron-ml2 openstack-neutron-linuxbridge python-neutronclient ebtables ipset
+
+echo "Installing Horizon"
+yum install -y openstack-dashboard
+
+echo "Configuring Stack"
+
+echo "Configuring NTP"
+CHRONYCONF=$(cat <<'EOF'
+# Use public servers from the pool.ntp.org project.
+# Please consider joining the pool (http://www.pool.ntp.org/join.html).
+server 0.centos.pool.ntp.org iburst
+server 1.centos.pool.ntp.org iburst
+server 2.centos.pool.ntp.org iburst
+server 3.centos.pool.ntp.org iburst
+
+# Ignore stratum in source selection.
+stratumweight 0
+
+# Record the rate at which the system clock gains/losses time.
+driftfile /var/lib/chrony/drift
+
+# Enable kernel RTC synchronization.
+rtcsync
+
+# In first three updates step the system clock instead of slew
+# if the adjustment is larger than 10 seconds.
+makestep 10 3
+
+# Allow NTP client access from local network.
+#allow 192.168/16
+
+# Listen for commands only on localhost.
+bindcmdaddress 127.0.0.1
+bindcmdaddress ::1
+
+# Serve time even if not synchronized to any NTP server.
+#local stratum 10
+
+keyfile /etc/chrony.keys
+
+# Specify the key used as password for chronyc.
+commandkey 1
+
+# Generate command key if missing.
+generatecommandkey
+
+# Disable logging of client accesses.
+noclientlog
+
+# Send a message to syslog if a clock adjustment is larger than 0.5 seconds.
+logchange 0.5
+
+logdir /var/log/chrony
+#log measurements statistics tracking
+
+EOF
+)
+
+echo "$CHRONYCONF" > /etc/chrony.conf
+
+DBCONF=$(cat <<'EOF'
+[mysqld]
+bind-address = 127.0.0.1
+
+default-storage-engine = innodb
+innodb_file_per_table
+collation-server = utf8_general_ci
+init-connect = 'SET NAMES utf8'
+character-set-server = utf8
+EOF
+)
+
+echo "$DBCONF" > /etc/my.cnf.d/mariadb_openstack.cnf
+
+echo "Enabling OpenStack Database"
+systemctl enable mariadb.service
+echo "Starting OpenStack Database"
+systemctl start mariadb.service
+
+echo "Configuring Database"
+# this should be able to replace it
+mysql -u root <<-EOF
+UPDATE mysql.user SET Password=PASSWORD('$DATABASE_PASS') WHERE User='root';
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+DELETE FROM mysql.user WHERE User='';
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\_%';
+FLUSH PRIVILEGES;
+EOF
+
+echo "Installing RabbitMQ"
+yum install -y rabbitmq-server
+systemctl enable rabbitmq-server.service
+systemctl start rabbitmq-server.service
+echo "Sleeping for 10 seconds to allow rabbitmq to come up"
+sleep 10
+rabbitmqctl add_user openstack $RABBIT_PASS
+rabbitmqctl set_permissions openstack ".*" ".*" ".*"
+
+
+echo "Installing Keystone"
+mysql -uroot -p$DATABASE_PASS <<-EOF
+create database keystone;
+grant all privileges on keystone.* to 'keystone'@'localhost' identified by '$KEYSTONE_DBPASS';
+grant all privileges on keystone.* to 'keystone'@'%' identified by '$KEYSTONE_DBPASS';
+EOF
+
+echo "Enabling Memcached"
+systemctl enable memcached.service
+
+echo "Starting Memcached"
+systemctl start memcached.service
+
+echo "Writing Keystone Conf"
+KEYSTONECONF=$(cat <<EOF
+[DEFAULT]
+
+admin_token = $ADMIN_TOKEN
+verbose     = False
+
+[assignment]
+
+[auth]
+
+[cache]
+
+[catalog]
+
+[cors]
+
+[cors.subdomain]
+
+[credential]
+
+[database]
+
+connection = mysql://keystone:$KEYSTONE_DBPASS@localhost/keystone
+
+[domain_config]
+
+[endpoint_filter]
+
+[endpoint_policy]
+
+[eventlet_server]
+
+[eventlet_server_ssl]
+
+[federation]
+
+[fernet_tokens]
+
+[identity]
+
+[identity_mapping]
+
+[kvs]
+
+[ldap]
+
+[matchmaker_redis]
+
+[matchmaker_ring]
+
+[memcache]
+
+servers = localhost:11211
+
+[oauth1]
+
+[os_inherit]
+
+[oslo_messaging_amqp]
+
+[oslo_messaging_qpid]
+
+[oslo_messaging_rabbit]
+
+[oslo_middleware]
+
+[oslo_policy]
+
+[paste_deploy]
+
+[policy]
+
+[resource]
+
+[revoke]
+
+driver = sql
+
+[role]
+
+[saml]
+
+[signing]
+
+[ssl]
+
+[token]
+
+provider  = uuid
+driver    = memcache
+
+[tokenless_auth]
+
+[trust]
+
+EOF
+)
+
+echo "$KEYSTONECONF" > /etc/keystone/keystone.conf
+
+echo "Populating Keystone Database"
+su -s /bin/sh -c "keystone-manage db_sync" keystone
+
+echo "Configuring Apache"
+sed -i "/^#ServerName/a ServerName $CONTROLLER" /etc/httpd/conf/httpd.conf
+
+APACHECONF=$(cat <<EOF
+Listen 5000
+Listen 35357
+
+<VirtualHost *:5000>
+    WSGIDaemonProcess keystone-public processes=5 threads=1 user=keystone group=keystone display-name=%{GROUP}
+    WSGIProcessGroup keystone-public
+    WSGIScriptAlias / /usr/bin/keystone-wsgi-public
+    WSGIApplicationGroup %{GLOBAL}
+    WSGIPassAuthorization On
+    <IfVersion >= 2.4>
+      ErrorLogFormat "%{cu}t %M"
+    </IfVersion>
+    ErrorLog /var/log/httpd/keystone-error.log
+    CustomLog /var/log/httpd/keystone-access.log combined
+
+    <Directory /usr/bin>
+        <IfVersion >= 2.4>
+            Require all granted
+        </IfVersion>
+        <IfVersion < 2.4>
+            Order allow,deny
+            Allow from all
+        </IfVersion>
+    </Directory>
+</VirtualHost>
+
+<VirtualHost *:35357>
+    WSGIDaemonProcess keystone-admin processes=5 threads=1 user=keystone group=keystone display-name=%{GROUP}
+    WSGIProcessGroup keystone-admin
+    WSGIScriptAlias / /usr/bin/keystone-wsgi-admin
+    WSGIApplicationGroup %{GLOBAL}
+    WSGIPassAuthorization On
+    <IfVersion >= 2.4>
+      ErrorLogFormat "%{cu}t %M"
+    </IfVersion>
+    ErrorLog /var/log/httpd/keystone-error.log
+    CustomLog /var/log/httpd/keystone-access.log combined
+
+    <Directory /usr/bin>
+        <IfVersion >= 2.4>
+            Require all granted
+        </IfVersion>
+        <IfVersion < 2.4>
+            Order allow,deny
+            Allow from all
+        </IfVersion>
+    </Directory>
+</VirtualHost>
+EOF
+)
+
+echo "$APACHECONF" > /etc/httpd/conf.d/wsgi-keystone.conf
+
+echo "Enabling Apache"
+systemctl enable httpd.service
+
+echo "Starting Apache"
+systemctl restart httpd.service
+
+echo "Configuring Keystone Stack"
+export OS_TOKEN=$ADMIN_TOKEN
+export OS_URL=http://$CONTROLLER:35357/v3
+export OS_IDENTITY_API_VERSION=3
+
+openstack service create --name keystone --description "OpenStack Identity" identity
+
+openstack endpoint create --region RegionOne identity public http://$CONTROLLER:5000/v2.0
+openstack endpoint create --region RegionOne identity internal http://$CONTROLLER:5000/v2.0
+openstack endpoint create --region RegionOne identity admin http://$CONTROLLER:35357/v2.0
+
+openstack project create --domain default --description "Admin Project" admin
+openstack user create --domain default --password $ADMIN_PASS admin
+openstack role create admin
+openstack role add --project admin --user admin admin
+
+openstack project create --domain default --description "Service Project" service
+
+openstack project create --domain default --description "Build Automation" $AUTOMATION_PROJECT
+openstack user create --domain default --password $AUTOMATION_PASS $AUTOMATION_USER
+openstack role create user
+openstack role add --project $AUTOMATION_PROJECT --user $AUTOMATION_USER user
+
+echo "Installing Glance DB"
+mysql -uroot -p$DATABASE_PASS <<-EOF
+create database glance;
+grant all privileges on glance.* to 'glance'@'localhost' identified by '$GLANCE_DBPASS';
+grant all privileges on glance.* to 'glance'@'%' identified by '$GLANCE_DBPASS';
+EOF
+
+echo "Configuring Glance"
+openstack user create --domain default --password $GLANCE_PASS glance
+openstack role add --project service --user glance admin
+
+openstack service create --name glance --description "OpenStack Image Service" image
+openstack endpoint create --region RegionOne image public http://$CONTROLLER:9292
+openstack endpoint create --region RegionOne image internal http:/$CONTROLLER:9292
+openstack endpoint create --region RegionOne image admin http:/$CONTROLLER:9292
+
+GLANCEAPICONF=$(cat <<EOF
+[DEFAULT]
+
+notification_driver = noop
+verbose             = False
+
+[database]
+
+connection = mysql://glance:$GLANCE_DBPASS@$CONTROLLER/glance
+
+[glance_store]
+
+default_store             = file
+filesystem_store_datadir  = /var/lib/glance/images/
+
+[image_format]
+
+[keystone_authtoken]
+
+auth_uri          = http://$CONTROLLER:5000
+auth_url          = http://$CONTROLLER:35357
+auth_plugin       = password
+project_domain_id = default
+user_domain_id    = default
+project_name      = service
+username          = glance
+password          = $GLANCE_PASS
+
+[matchmaker_redis]
+
+[matchmaker_ring]
+
+[oslo_concurrency]
+
+[oslo_messaging_amqp]
+
+[oslo_messaging_qpid]
+
+[oslo_messaging_rabbit]
+
+[oslo_policy]
+
+[paste_deploy]
+
+flavor = keystone
+
+[store_type_location_strategy]
+
+[task]
+
+[taskflow_executor]
+EOF
+)
+
+echo "$GLANCEAPICONF" > /etc/glance/glance-api.conf
+
+GLANCEREGISTRYCONF=$(cat <<EOF
+[DEFAULT]
+
+notification_driver = noop
+verbose             = False
+
+[database]
+
+connection = mysql://glance:$GLANCE_DBPASS@$CONTROLLER/glance
+
+[glance_store]
+
+[keystone_authtoken]
+
+auth_uri          = http://$CONTROLLER:5000
+auth_url          = http://$CONTROLLER:35357
+auth_plugin       = password
+project_domain_id = default
+user_domain_id    = default
+project_name      = service
+username          = glance
+password          = $GLANCE_PASS
+
+[matchmaker_redis]
+
+[matchmaker_ring]
+
+[oslo_messaging_amqp]
+
+[oslo_messaging_qpid]
+
+[oslo_messaging_rabbit]
+
+[oslo_policy]
+
+[paste_deploy]
+EOF
+)
+
+echo "$GLANCEREGISTRYCONF" > /etc/glance/glance-registry.conf
+
+echo "Populating Glance Database"
+su -s /bin/sh -c "glance-manage db_sync" glance
+
+echo "Enabling Glance API and Registry"
+systemctl enable openstack-glance-api.service openstack-glance-registry.service
+
+echo "Starting Glance API and Registry"
+systemctl start openstack-glance-api.service openstack-glance-registry.service
+
+echo "Installing Nova"
+mysql -uroot -p$DATABASE_PASS <<-EOF
+create database nova;
+grant all privileges on nova.* to 'nova'@'localhost' identified by '$NOVA_DBPASS';
+grant all privileges on nova.* to 'nova'@'%' identified by '$NOVA_DBPASS';
+EOF
+
+echo "Configuring Stack for Nova"
+openstack user create --domain default --password $NOVA_PASS nova
+openstack role add --project service --user nova admin
+openstack service create --name nova --description "OpenStack Compute" compute
+openstack endpoint create --region RegionOne compute public http://$CONTROLLER:8774/v2/%\(tenant_id\)s
+openstack endpoint create --region RegionOne compute internal http://$CONTROLLER:8774/v2/%\(tenant_id\)s
+openstack endpoint create --region RegionOne compute admin http://$CONTROLLER:8774/v2/%\(tenant_id\)s
+
+echo "Writing Nova Conf"
+NOVACONF=$(cat <<EOF
+[DEFAULT]
+
+rpc_backend               = rabbit
+auth_strategy             = keystone
+my_ip                     = $IPADDRESS
+network_api_class         = nova.network.neutronv2.api.API
+security_group_api        = neutron
+linuxnet_interface_driver = nova.network.linux_net.NeutronLinuxBridgeInterfaceDriver
+firewall_driver           = nova.virt.firewall.NoopFirewallDriver
+enabled_apis              = osapi_compute,metadata
+verbose                   = False
+dhcp_domain               = $DHCP_DOMAIN
+
+[api_database]
+
+[barbican]
+
+[cells]
+
+[cinder]
+
+[conductor]
+
+[cors]
+
+[cors.subdomain]
+
+[database]
+
+connection = mysql://nova:$NOVA_DBPASS@$CONTROLLER/nova
+
+[ephemeral_storage_encryption]
+
+[glance]
+
+host = $CONTROLLER
+
+[guestfs]
+
+[hyperv]
+
+[image_file_url]
+
+[ironic]
+
+[keymgr]
+
+[keystone_authtoken]
+
+auth_uri          = http://$CONTROLLER:5000
+auth_url          = http://$CONTROLLER:35357
+auth_plugin       = password
+project_domain_id = default
+user_domain_id    = default
+project_name      = service
+username          = nova
+password          = $NOVA_PASS
+
+[libvirt]
+
+virt_type = $VIRTTYPE
+block_migration_flag = VIR_MIGRATE_UNDEFINE_SOURCE, VIR_MIGRATE_PEER2PEER, VIR_MIGRATE_LIVE, VIR_MIGRATE_NON_SHARED_INC
+
+[matchmaker_redis]
+
+[matchmaker_ring]
+
+[metrics]
+
+[neutron]
+
+url                           = http://$CONTROLLER:9696
+auth_url                      = http://$CONTROLLER:35357
+auth_plugin                   = password
+project_domain_id             = default
+user_domain_id                = default
+region_name                   = RegionOne
+project_name                  = service
+username                      = neutron
+password                      = $NEUTRON_PASS
+service_metadata_proxy        = True
+metadata_proxy_shared_secret  = $METADATA_SECRET
+
+[osapi_v21]
+
+[oslo_concurrency]
+
+lock_path = /var/lib/nova/tmp
+
+[oslo_messaging_amqp]
+
+[oslo_messaging_qpid]
+
+[oslo_messaging_rabbit]
+
+rabbit_host     = $CONTROLLER
+rabbit_userid   = openstack
+rabbit_password = $RABBIT_PASS
+
+[oslo_middleware]
+
+[rdp]
+
+[serial_console]
+
+[spice]
+
+[ssl]
+
+[trusted_computing]
+
+[upgrade_levels]
+
+[vmware]
+
+[vnc]
+
+enabled                       = True
+vncserver_listen              = \$my_ip
+vncserver_proxyclient_address = \$my_ip
+novncproxy_base_url           = http://$CONTROLLER:6080/vnc_auto.html
+
+[workarounds]
+
+[xenserver]
+
+[zookeeper]
+
+EOF
+)
+
+echo "$NOVACONF" > /etc/nova/nova.conf
+
+echo "Populating Nova DB"
+su -s /bin/sh -c "nova-manage db sync" nova
+
+echo "Enabling Nova Services"
+systemctl enable openstack-nova-api.service openstack-nova-cert.service openstack-nova-consoleauth.service openstack-nova-scheduler.service openstack-nova-conductor.service openstack-nova-novncproxy.service libvirtd.service openstack-nova-compute.service
+
+echo "Starting Nova Services"
+systemctl start openstack-nova-api.service openstack-nova-cert.service openstack-nova-consoleauth.service openstack-nova-scheduler.service openstack-nova-conductor.service openstack-nova-novncproxy.service libvirtd.service openstack-nova-compute.service
+
+echo "Installing Neutron"
+mysql -uroot -p$DATABASE_PASS <<-EOF
+create database neutron;
+grant all privileges on neutron.* to 'neutron'@'localhost' identified by '$NEUTRON_DBPASS';
+grant all privileges on neutron.* to 'neutron'@'%' identified by '$NEUTRON_DBPASS';
+EOF
+
+echo "Configuring Neutron Stack"
+openstack user create --domain default --password $NEUTRON_PASS neutron
+openstack role add --project service --user neutron admin
+openstack service create --name neutron --description "OpenStackNetworking" network
+openstack endpoint create --region RegionOne network public http://$CONTROLLER:9696
+openstack endpoint create --region RegionOne network internal http://$CONTROLLER:9696
+openstack endpoint create --region RegionOne network admin http://$CONTROLLER:9696
+
+echo "Writing Neutron Configs"
+NEUTRONCONF=$(cat <<EOF
+[DEFAULT]
+
+core_plugin                         = ml2
+service_plugins                     = router
+allow_overlapping_ips               = True
+rpc_backend                         = rabbit
+auth_strategy                       = keystone
+notify_nova_on_port_status_changes  = True
+notify_nova_on_port_data_changes    = True
+nova_url                            = http://$CONTROLLER:8774/v2
+verbose                             = False
+dns_domain                          = $DOMAIN
+
+[matchmaker_redis]
+
+[matchmaker_ring]
+
+[quotas]
+
+[agent]
+
+[keystone_authtoken]
+
+auth_uri          = http://$CONTROLLER:5000
+auth_url          = http://$CONTROLLER:35357
+auth_plugin       = password
+project_domain_id = default
+user_domain_id    = default
+project_name      = service
+username          = neutron
+password          = $NEUTRON_PASS
+
+[database]
+
+connection = mysql://neutron:$NEUTRON_DBPASS@$CONTROLLER/neutron
+
+[nova]
+
+auth_url          = http://$CONTROLLER:35357
+auth_plugin       = password
+project_domain_id = default
+user_domain_id    = default
+region_name       = RegionOne
+project_name      = service
+username          = nova
+password          = $NOVA_PASS
+
+[oslo_concurrency]
+
+lock_path = /var/lib/neutron/tmp
+
+[oslo_policy]
+
+[oslo_messaging_amqp]
+
+[oslo_messaging_qpid]
+
+[oslo_messaging_rabbit]
+
+rabbit_host     = $CONTROLLER
+rabbit_userid   = openstack
+rabbit_password = $RABBIT_PASS
+
+[qos]
+
+
+EOF
+)
+
+echo "$NEUTRONCONF" > /etc/neutron/neutron.conf
+
+ML2CONF=$(cat <<EOF
+[ml2]
+
+type_drivers          = flat,vlan,vxlan
+tenant_network_types  = vxlan
+mechanism_drivers     = linuxbridge,l2population
+extension_drivers     = port_security
+
+[ml2_type_flat]
+
+flat_networks = public
+
+[ml2_type_vlan]
+
+[ml2_type_gre]
+
+[ml2_type_vxlan]
+vni_ranges = 1:1000
+
+[ml2_type_geneve]
+
+[securitygroup]
+
+enable_ipset = True
+EOF
+)
+
+echo "$ML2CONF" > /etc/neutron/plugins/ml2/ml2_conf.ini
+
+
+LINUXBRIDGECONF=$(cat <<EOF
+[linux_bridge]
+
+physical_interface_mappings = public:$PUBLIC_INTERFACE
+
+[vxlan]
+
+enable_vxlan = True
+local_ip = $IPADDRESS
+l2_population = True
+
+[agent]
+
+prevent_arp_spoofing = True
+
+[securitygroup]
+
+enable_security_group = True
+firewall_driver       = neutron.agent.linux.iptables_firewall.IptablesFirewallDriver
+EOF
+)
+
+echo "$LINUXBRIDGECONF" > /etc/neutron/plugins/ml2/linuxbridge_agent.ini
+
+L3AGENT=$(cat <<EOF
+[DEFAULT]
+interface_driver = neutron.agent.linux.interface.BridgeInterfaceDriver
+external_network_bridge =
+verbose = True
+
+[AGENT]
+EOF
+)
+
+echo "$L3AGENT" > /etc/neutron/l3_agent.ini
+
+DHCPCONF=$(cat <<EOF
+[DEFAULT]
+
+interface_driver          = neutron.agent.linux.interface.BridgeInterfaceDriver
+dhcp_driver               = neutron.agent.linux.dhcp.Dnsmasq
+enable_isolated_metadata  = True
+verbose                   = False
+dhcp_domain               = $DOMAIN
+dnspasq_config_file = /etc/neutron/dnsmasq-neutron.conf
+
+[AGENT]
+EOF
+)
+
+echo "$DHCPCONF" > /etc/neutron/dhcp_agent.ini
+
+DMSMASQCONF=$(cat <<EOF
+dhcp-option-force=26,1450
+EOF
+)
+
+echo "$DNSMASQCONF" > /etc/neutron/dsnmasq-neutron.conf
+
+METADATACONF=$(cat <<EOF
+[DEFAULT]
+
+auth_uri                      = http://$CONTROLLER:5000
+auth_url                      = http://$CONTROLLER:35357
+auth_region                   = RegionOne
+auth_plugin                   = password
+project_domain_id             = default
+user_domain_id                = default
+project_name                  = service
+username                      = neutron
+password                      = $NEUTRON_PASS
+nova_metadata_ip              = $CONTROLLER
+metadata_proxy_shared_secret  = $METADATA_SECRET
+verbose                       = False
+
+[AGENT]
+EOF
+)
+
+echo "$METADATACONF" > /etc/neutron/metadata_agent.ini
+
+ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini
+
+echo "Populating Neutron Database"
+su -s /bin/sh -c "neutron-db-manage --config-file /etc/neutron/neutron.conf --config-file /etc/neutron/plugins/ml2/ml2_conf.ini upgrade head" neutron
+
+echo "Restarting Nova"
+systemctl restart openstack-nova-api.service
+
+echo "Enabling Neutron Services"
+systemctl enable neutron-server.service neutron-linuxbridge-agent.service neutron-dhcp-agent.service neutron-l3-agent.service neutron-metadata-agent.service
+
+echo "Starting Neutron Services"
+systemctl start neutron-server.service neutron-linuxbridge-agent.service neutron-dhcp-agent.service neutron-l3-agent.service neutron-metadata-agent.service
+
+HORIZONCONF=$(cat <<EOF
+import os
+
+from django.utils.translation import ugettext_lazy as _
+
+
+from openstack_dashboard import exceptions
+from openstack_dashboard.settings import HORIZON_CONFIG
+
+DEBUG = False
+TEMPLATE_DEBUG = DEBUG
+
+
+# WEBROOT is the location relative to Webserver root
+# should end with a slash.
+#WEBROOT = '/dashboard/'
+WEBROOT = '/'
+# LOGIN_URL = WEBROOT + 'auth/login/'
+# LOGOUT_URL = WEBROOT + 'auth/logout/'
+#
+# LOGIN_REDIRECT_URL can be used as an alternative for
+# HORIZON_CONFIG.user_home, if user_home is not set.
+# Do not set it to '/home/', as this will cause circular redirect loop
+#LOGIN_REDIRECT_URL = WEBROOT
+
+# Required for Django 1.5.
+# If horizon is running in production (DEBUG is False), set this
+# with the list of host/domain names that the application can serve.
+# For more information see:
+# https://docs.djangoproject.com/en/dev/ref/settings/#allowed-hosts
+ALLOWED_HOSTS = ['*', ]
+
+# Set SSL proxy settings:
+# For Django 1.4+ pass this header from the proxy after terminating the SSL,
+# and don't forget to strip it from the client's request.
+# For more information see:
+# https://docs.djangoproject.com/en/1.4/ref/settings/#secure-proxy-ssl-header
+#SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTOCOL', 'https')
+# https://docs.djangoproject.com/en/1.5/ref/settings/#secure-proxy-ssl-header
+#SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+# If Horizon is being served through SSL, then uncomment the following two
+# settings to better secure the cookies from security exploits
+#CSRF_COOKIE_SECURE = True
+#SESSION_COOKIE_SECURE = True
+
+# Overrides for OpenStack API versions. Use this setting to force the
+# OpenStack dashboard to use a specific API version for a given service API.
+# Versions specified here should be integers or floats, not strings.
+# NOTE: The version should be formatted as it appears in the URL for the
+# service API. For example, The identity service APIs have inconsistent
+# use of the decimal point, so valid options would be 2.0 or 3.
+OPENSTACK_API_VERSIONS = {
+  "identity": 3,
+  "volume": 2,
+}
+
+# Set this to True if running on multi-domain model. When this is enabled, it
+# will require user to enter the Domain name in addition to username for login.
+#OPENSTACK_KEYSTONE_MULTIDOMAIN_SUPPORT = False
+
+# Overrides the default domain used when running on single-domain model
+# with Keystone V3. All entities will be created in the default domain.
+#OPENSTACK_KEYSTONE_DEFAULT_DOMAIN = 'Default'
+
+# Set Console type:
+# valid options are "AUTO"(default), "VNC", "SPICE", "RDP", "SERIAL" or None
+# Set to None explicitly if you want to deactivate the console.
+#CONSOLE_TYPE = "AUTO"
+
+# Show backdrop element outside the modal, do not close the modal
+# after clicking on backdrop.
+#HORIZON_CONFIG["modal_backdrop"] = "static"
+
+# Specify a regular expression to validate user passwords.
+#HORIZON_CONFIG["password_validator"] = {
+#    "regex": '.*',
+#    "help_text": _("Your password does not meet the requirements."),
+#}
+
+# Disable simplified floating IP address management for deployments with
+# multiple floating IP pools or complex network requirements.
+#HORIZON_CONFIG["simple_ip_management"] = False
+
+# Turn off browser autocompletion for forms including the login form and
+# the database creation workflow if so desired.
+#HORIZON_CONFIG["password_autocomplete"] = "off"
+
+# Setting this to True will disable the reveal button for password fields,
+# including on the login form.
+#HORIZON_CONFIG["disable_password_reveal"] = False
+
+LOCAL_PATH = '/tmp'
+
+# Set custom secret key:
+# You can either set it to a specific value or you can let horizon generate a
+# default secret key that is unique on this machine, e.i. regardless of the
+# amount of Python WSGI workers (if used behind Apache+mod_wsgi): However,
+# there may be situations where you would want to set this explicitly, e.g.
+# when multiple dashboard instances are distributed on different machines
+# (usually behind a load-balancer). Either you have to make sure that a session
+# gets all requests routed to the same dashboard instance or you set the same
+# SECRET_KEY for all of them.
+SECRET_KEY='98ff1c9372b071cdfe18'
+
+# We recommend you use memcached for development; otherwise after every reload
+# of the django development server, you will have to login again. To use
+# memcached set CACHES to something like
+#CACHES = {
+#    'default': {
+#        'BACKEND': 'django.core.cache.backends.memcached.MemcachedCache',
+#        'LOCATION': '127.0.0.1:11211',
+#    }
+#}
+
+CACHES = {
+  'default': {
+    'BACKEND': 'django.core.cache.backends.memcached.MemcachedCache',
+    'LOCATION': '127.0.0.1:11211',
+  }
+}
+
+# Send email to the console by default
+EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+# Or send them to /dev/null
+#EMAIL_BACKEND = 'django.core.mail.backends.dummy.EmailBackend'
+
+# Configure these for your outgoing email host
+#EMAIL_HOST = 'smtp.my-company.com'
+#EMAIL_PORT = 25
+#EMAIL_HOST_USER = 'djangomail'
+#EMAIL_HOST_PASSWORD = 'top-secret!'
+
+# For multiple regions uncomment this configuration, and add (endpoint, title).
+#AVAILABLE_REGIONS = [
+#    ('http://cluster1.example.com:5000/v2.0', 'cluster1'),
+#    ('http://cluster2.example.com:5000/v2.0', 'cluster2'),
+#]
+
+OPENSTACK_HOST = "$CONTROLLER"
+OPENSTACK_KEYSTONE_URL = "http://%s:5000/v2.0" % OPENSTACK_HOST
+OPENSTACK_KEYSTONE_DEFAULT_ROLE = "user"
+
+# Enables keystone web single-sign-on if set to True.
+#WEBSSO_ENABLED = False
+
+# Determines which authentication choice to show as default.
+#WEBSSO_INITIAL_CHOICE = "credentials"
+
+# The list of authentication mechanisms
+# which include keystone federation protocols.
+# Current supported protocol IDs are 'saml2' and 'oidc'
+# which represent SAML 2.0, OpenID Connect respectively.
+# Do not remove the mandatory credentials mechanism.
+#WEBSSO_CHOICES = (
+#    ("credentials", _("Keystone Credentials")),
+#    ("oidc", _("OpenID Connect")),
+#    ("saml2", _("Security Assertion Markup Language")))
+
+# Disable SSL certificate checks (useful for self-signed certificates):
+#OPENSTACK_SSL_NO_VERIFY = True
+
+# The CA certificate to use to verify SSL connections
+#OPENSTACK_SSL_CACERT = '/path/to/cacert.pem'
+
+# The OPENSTACK_KEYSTONE_BACKEND settings can be used to identify the
+# capabilities of the auth backend for Keystone.
+# If Keystone has been configured to use LDAP as the auth backend then set
+# can_edit_user to False and name to 'ldap'.
+#
+# TODO(tres): Remove these once Keystone has an API to identify auth backend.
+OPENSTACK_KEYSTONE_BACKEND = {
+    'name': 'native',
+    'can_edit_user': True,
+    'can_edit_group': True,
+    'can_edit_project': True,
+    'can_edit_domain': True,
+    'can_edit_role': True,
+}
+
+# Setting this to True, will add a new "Retrieve Password" action on instance,
+# allowing Admin session password retrieval/decryption.
+#OPENSTACK_ENABLE_PASSWORD_RETRIEVE = False
+
+# The Launch Instance user experience has been significantly enhanced.
+# You can choose whether to enable the new launch instance experience,
+# the legacy experience, or both. The legacy experience will be removed
+# in a future release, but is available as a temporary backup setting to ensure
+# compatibility with existing deployments. Further development will not be
+# done on the legacy experience. Please report any problems with the new
+# experience via the Launchpad tracking system.
+#
+# Toggle LAUNCH_INSTANCE_LEGACY_ENABLED and LAUNCH_INSTANCE_NG_ENABLED to
+# determine the experience to enable.  Set them both to true to enable
+# both.
+#LAUNCH_INSTANCE_LEGACY_ENABLED = True
+#LAUNCH_INSTANCE_NG_ENABLED = False
+
+# The Xen Hypervisor has the ability to set the mount point for volumes
+# attached to instances (other Hypervisors currently do not). Setting
+# can_set_mount_point to True will add the option to set the mount point
+# from the UI.
+OPENSTACK_HYPERVISOR_FEATURES = {
+    'can_set_mount_point': False,
+    'can_set_password': False,
+    'requires_keypair': False,
+}
+
+# The OPENSTACK_CINDER_FEATURES settings can be used to enable optional
+# services provided by cinder that is not exposed by its extension API.
+OPENSTACK_CINDER_FEATURES = {
+    'enable_backup': False,
+}
+
+# The OPENSTACK_NEUTRON_NETWORK settings can be used to enable optional
+# services provided by neutron. Options currently available are load
+# balancer service, security groups, quotas, VPN service.
+OPENSTACK_NEUTRON_NETWORK = {
+    'enable_router': True,
+    'enable_quotas': True,
+    'enable_ipv6': True,
+    'enable_distributed_router': False,
+    'enable_ha_router': False,
+    'enable_lb': False,
+    'enable_firewall': False,
+    'enable_vpn': False,
+    'enable_fip_topology_check': False,
+
+    # Neutron can be configured with a default Subnet Pool to be used for IPv4
+    # subnet-allocation. Specify the label you wish to display in the Address
+    # pool selector on the create subnet step if you want to use this feature.
+    'default_ipv4_subnet_pool_label': None,
+
+    # Neutron can be configured with a default Subnet Pool to be used for IPv6
+    # subnet-allocation. Specify the label you wish to display in the Address
+    # pool selector on the create subnet step if you want to use this feature.
+    # You must set this to enable IPv6 Prefix Delegation in a PD-capable
+    # environment.
+    'default_ipv6_subnet_pool_label': None,
+
+    # The profile_support option is used to detect if an external router can be
+    # configured via the dashboard. When using specific plugins the
+    # profile_support can be turned on if needed.
+    'profile_support': None,
+    #'profile_support': 'cisco',
+
+    # Set which provider network types are supported. Only the network types
+    # in this list will be available to choose from when creating a network.
+    # Network types include local, flat, vlan, gre, and vxlan.
+    'supported_provider_types': ['*'],
+
+    # Set which VNIC types are supported for port binding. Only the VNIC
+    # types in this list will be available to choose from when creating a
+    # port.
+    # VNIC types include 'normal', 'macvtap' and 'direct'.
+    # Set to empty list or None to disable VNIC type selection.
+    'supported_vnic_types': ['*']
+}
+
+# The OPENSTACK_IMAGE_BACKEND settings can be used to customize features
+# in the OpenStack Dashboard related to the Image service, such as the list
+# of supported image formats.
+#OPENSTACK_IMAGE_BACKEND = {
+#    'image_formats': [
+#        ('', _('Select format')),
+#        ('aki', _('AKI - Amazon Kernel Image')),
+#        ('ami', _('AMI - Amazon Machine Image')),
+#        ('ari', _('ARI - Amazon Ramdisk Image')),
+#        ('docker', _('Docker')),
+#        ('iso', _('ISO - Optical Disk Image')),
+#        ('ova', _('OVA - Open Virtual Appliance')),
+#        ('qcow2', _('QCOW2 - QEMU Emulator')),
+#        ('raw', _('Raw')),
+#        ('vdi', _('VDI - Virtual Disk Image')),
+#        ('vhd', ('VHD - Virtual Hard Disk')),
+#        ('vmdk', _('VMDK - Virtual Machine Disk')),
+#    ]
+#}
+
+# The IMAGE_CUSTOM_PROPERTY_TITLES settings is used to customize the titles for
+# image custom property attributes that appear on image detail pages.
+IMAGE_CUSTOM_PROPERTY_TITLES = {
+    "architecture": _("Architecture"),
+    "kernel_id": _("Kernel ID"),
+    "ramdisk_id": _("Ramdisk ID"),
+    "image_state": _("Euca2ools state"),
+    "project_id": _("Project ID"),
+    "image_type": _("Image Type"),
+}
+
+# The IMAGE_RESERVED_CUSTOM_PROPERTIES setting is used to specify which image
+# custom properties should not be displayed in the Image Custom Properties
+# table.
+IMAGE_RESERVED_CUSTOM_PROPERTIES = []
+
+# OPENSTACK_ENDPOINT_TYPE specifies the endpoint type to use for the endpoints
+# in the Keystone service catalog. Use this setting when Horizon is running
+# external to the OpenStack environment. The default is 'publicURL'.
+#OPENSTACK_ENDPOINT_TYPE = "publicURL"
+
+# SECONDARY_ENDPOINT_TYPE specifies the fallback endpoint type to use in the
+# case that OPENSTACK_ENDPOINT_TYPE is not present in the endpoints
+# in the Keystone service catalog. Use this setting when Horizon is running
+# external to the OpenStack environment. The default is None.  This
+# value should differ from OPENSTACK_ENDPOINT_TYPE if used.
+#SECONDARY_ENDPOINT_TYPE = "publicURL"
+
+# The number of objects (Swift containers/objects or images) to display
+# on a single page before providing a paging element (a "more" link)
+# to paginate results.
+API_RESULT_LIMIT = 1000
+API_RESULT_PAGE_SIZE = 20
+
+# The size of chunk in bytes for downloading objects from Swift
+SWIFT_FILE_TRANSFER_CHUNK_SIZE = 512 * 1024
+
+# Specify a maximum number of items to display in a dropdown.
+DROPDOWN_MAX_ITEMS = 30
+
+# The timezone of the server. This should correspond with the timezone
+# of your entire OpenStack installation, and hopefully be in UTC.
+TIME_ZONE = "America/Los_Angeles"
+
+# When launching an instance, the menu of available flavors is
+# sorted by RAM usage, ascending. If you would like a different sort order,
+# you can provide another flavor attribute as sorting key. Alternatively, you
+# can provide a custom callback method to use for sorting. You can also provide
+# a flag for reverse sort. For more info, see
+# http://docs.python.org/2/library/functions.html#sorted
+#CREATE_INSTANCE_FLAVOR_SORT = {
+#    'key': 'name',
+#     # or
+#    'key': my_awesome_callback_method,
+#    'reverse': False,
+#}
+
+# Set this to True to display an 'Admin Password' field on the Change Password
+# form to verify that it is indeed the admin logged-in who wants to change
+# the password.
+#ENFORCE_PASSWORD_CHECK = False
+
+# Modules that provide /auth routes that can be used to handle different types
+# of user authentication. Add auth plugins that require extra route handling to
+# this list.
+#AUTHENTICATION_URLS = [
+#    'openstack_auth.urls',
+#]
+
+# The Horizon Policy Enforcement engine uses these values to load per service
+# policy rule files. The content of these files should match the files the
+# OpenStack services are using to determine role based access control in the
+# target installation.
+
+
+# Map of local copy of service policy files.
+# Please insure that your identity policy file matches the one being used on
+# your keystone servers. There is an alternate policy file that may be used
+# in the Keystone v3 multi-domain case, policy.v3cloudsample.json.
+# This file is not included in the Horizon repository by default but can be
+# found at
+# http://git.openstack.org/cgit/openstack/keystone/tree/etc/ \
+# policy.v3cloudsample.json
+# Having matching policy files on the Horizon and Keystone servers is essential
+# for normal operation. This holds true for all services and their policy files.
+POLICY_FILES_PATH = '/etc/openstack-dashboard'
+POLICY_FILES_PATH = '/etc/openstack-dashboard'
+# Map of local copy of service policy files
+#POLICY_FILES = {
+#    'identity': 'keystone_policy.json',
+#    'compute': 'nova_policy.json',
+#    'volume': 'cinder_policy.json',
+#    'image': 'glance_policy.json',
+#    'orchestration': 'heat_policy.json',
+#    'network': 'neutron_policy.json',
+#    'telemetry': 'ceilometer_policy.json',
+#}
+
+# Trove user and database extension support. By default support for
+# creating users and databases on database instances is turned on.
+# To disable these extensions set the permission here to something
+# unusable such as ["!"].
+#TROVE_ADD_USER_PERMS = []
+#TROVE_ADD_DATABASE_PERMS = []
+
+# Change this patch to the appropriate static directory containing
+# two files: _variables.scss and _styles.scss
+#CUSTOM_THEME_PATH = 'themes/default'
+
+LOGGING = {
+    'version': 1,
+    # When set to True this will disable all logging except
+    # for loggers specified in this configuration dictionary. Note that
+    # if nothing is specified here and disable_existing_loggers is True,
+    # django.db.backends will still log unless it is disabled explicitly.
+    'disable_existing_loggers': False,
+    'handlers': {
+        'null': {
+            'level': 'DEBUG',
+            'class': 'django.utils.log.NullHandler',
+        },
+        'console': {
+            # Set the level to "DEBUG" for verbose output logging.
+            'level': 'INFO',
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'loggers': {
+        # Logging from django.db.backends is VERY verbose, send to null
+        # by default.
+        'django.db.backends': {
+            'handlers': ['null'],
+            'propagate': False,
+        },
+        'requests': {
+            'handlers': ['null'],
+            'propagate': False,
+        },
+        'horizon': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'openstack_dashboard': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'novaclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'cinderclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'keystoneclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'glanceclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'neutronclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'heatclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'ceilometerclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'troveclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'swiftclient': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'openstack_auth': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'nose.plugins.manager': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'django': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'iso8601': {
+            'handlers': ['null'],
+            'propagate': False,
+        },
+        'scss': {
+            'handlers': ['null'],
+            'propagate': False,
+        },
+    }
+}
+
+# 'direction' should not be specified for all_tcp/udp/icmp.
+# It is specified in the form.
+SECURITY_GROUP_RULES = {
+    'all_tcp': {
+        'name': _('All TCP'),
+        'ip_protocol': 'tcp',
+        'from_port': '1',
+        'to_port': '65535',
+    },
+    'all_udp': {
+        'name': _('All UDP'),
+        'ip_protocol': 'udp',
+        'from_port': '1',
+        'to_port': '65535',
+    },
+    'all_icmp': {
+        'name': _('All ICMP'),
+        'ip_protocol': 'icmp',
+        'from_port': '-1',
+        'to_port': '-1',
+    },
+    'ssh': {
+        'name': 'SSH',
+        'ip_protocol': 'tcp',
+        'from_port': '22',
+        'to_port': '22',
+    },
+    'smtp': {
+        'name': 'SMTP',
+        'ip_protocol': 'tcp',
+        'from_port': '25',
+        'to_port': '25',
+    },
+    'dns': {
+        'name': 'DNS',
+        'ip_protocol': 'tcp',
+        'from_port': '53',
+        'to_port': '53',
+    },
+    'http': {
+        'name': 'HTTP',
+        'ip_protocol': 'tcp',
+        'from_port': '80',
+        'to_port': '80',
+    },
+    'pop3': {
+        'name': 'POP3',
+        'ip_protocol': 'tcp',
+        'from_port': '110',
+        'to_port': '110',
+    },
+    'imap': {
+        'name': 'IMAP',
+        'ip_protocol': 'tcp',
+        'from_port': '143',
+        'to_port': '143',
+    },
+    'ldap': {
+        'name': 'LDAP',
+        'ip_protocol': 'tcp',
+        'from_port': '389',
+        'to_port': '389',
+    },
+    'https': {
+        'name': 'HTTPS',
+        'ip_protocol': 'tcp',
+        'from_port': '443',
+        'to_port': '443',
+    },
+    'smtps': {
+        'name': 'SMTPS',
+        'ip_protocol': 'tcp',
+        'from_port': '465',
+        'to_port': '465',
+    },
+    'imaps': {
+        'name': 'IMAPS',
+        'ip_protocol': 'tcp',
+        'from_port': '993',
+        'to_port': '993',
+    },
+    'pop3s': {
+        'name': 'POP3S',
+        'ip_protocol': 'tcp',
+        'from_port': '995',
+        'to_port': '995',
+    },
+    'ms_sql': {
+        'name': 'MS SQL',
+        'ip_protocol': 'tcp',
+        'from_port': '1433',
+        'to_port': '1433',
+    },
+    'mysql': {
+        'name': 'MYSQL',
+        'ip_protocol': 'tcp',
+        'from_port': '3306',
+        'to_port': '3306',
+    },
+    'rdp': {
+        'name': 'RDP',
+        'ip_protocol': 'tcp',
+        'from_port': '3389',
+        'to_port': '3389',
+    },
+}
+
+# Deprecation Notice:
+#
+# The setting FLAVOR_EXTRA_KEYS has been deprecated.
+# Please load extra spec metadata into the Glance Metadata Definition Catalog.
+#
+# The sample quota definitions can be found in:
+# <glance_source>/etc/metadefs/compute-quota.json
+#
+# The metadata definition catalog supports CLI and API:
+#  \$glance --os-image-api-version 2 help md-namespace-import
+#  \$glance-manage db_load_metadefs <directory_with_definition_files>
+#
+# See Metadata Definitions on: http://docs.openstack.org/developer/glance/
+
+# Indicate to the Sahara data processing service whether or not
+# automatic floating IP allocation is in effect.  If it is not
+# in effect, the user will be prompted to choose a floating IP
+# pool for use in their cluster.  False by default.  You would want
+# to set this to True if you were running Nova Networking with
+# auto_assign_floating_ip = True.
+#SAHARA_AUTO_IP_ALLOCATION_ENABLED = False
+
+# The hash algorithm to use for authentication tokens. This must
+# match the hash algorithm that the identity server and the
+# auth_token middleware are using. Allowed values are the
+# algorithms supported by Python's hashlib library.
+#OPENSTACK_TOKEN_HASH_ALGORITHM = 'md5'
+
+# Hashing tokens from Keystone keeps the Horizon session data smaller, but it
+# doesn't work in some cases when using PKI tokens.  Uncomment this value and
+# set it to False if using PKI tokens and there are 401 errors due to token
+# hashing.
+#OPENSTACK_TOKEN_HASH_ENABLED = True
+
+# AngularJS requires some settings to be made available to
+# the client side. Some settings are required by in-tree / built-in horizon
+# features. These settings must be added to REST_API_REQUIRED_SETTINGS in the
+# form of ['SETTING_1','SETTING_2'], etc.
+#
+# You may remove settings from this list for security purposes, but do so at
+# the risk of breaking a built-in horizon feature. These settings are required
+# for horizon to function properly. Only remove them if you know what you
+# are doing. These settings may in the future be moved to be defined within
+# the enabled panel configuration.
+# You should not add settings to this list for out of tree extensions.
+# See: https://wiki.openstack.org/wiki/Horizon/RESTAPI
+REST_API_REQUIRED_SETTINGS = ['OPENSTACK_HYPERVISOR_FEATURES']
+
+# Additional settings can be made available to the client side for
+# extensibility by specifying them in REST_API_ADDITIONAL_SETTINGS
+# !! Please use extreme caution as the settings are transferred via HTTP/S
+# and are not encrypted on the browser. This is an experimental API and
+# may be deprecated in the future without notice.
+#REST_API_ADDITIONAL_SETTINGS = []
+
+# DISALLOW_IFRAME_EMBED can be used to prevent Horizon from being embedded
+# within an iframe. Legacy browsers are still vulnerable to a Cross-Frame
+# Scripting (XFS) vulnerability, so this option allows extra security hardening
+# where iframes are not used in deployment. Default setting is True.
+# For more information see:
+# http://tinyurl.com/anticlickjack
+#DISALLOW_IFRAME_EMBED = True
+EOF
+)
+
+echo "$HORIZONCONF" > /etc/openstack-dashboard/local_settings
+
+HORIZONAPACHE=$(cat <<EOF
+WSGIDaemonProcess dashboard
+WSGIProcessGroup dashboard
+WSGISocketPrefix run/wsgi
+
+WSGIScriptAlias / /usr/share/openstack-dashboard/openstack_dashboard/wsgi/django.wsgi
+Alias /static /usr/share/openstack-dashboard/static
+
+<Directory /usr/share/openstack-dashboard/openstack_dashboard/wsgi>
+  Options All
+  AllowOverride All
+  Require all granted
+</Directory>
+
+<Directory /usr/share/openstack-dashboard/static>
+  Options All
+  AllowOverride All
+  Require all granted
+</Directory>
+EOF
+)
+
+echo "$HORIZONAPACHE" > /etc/httpd/conf.d/openstack-dashboard.conf
+
+echo "Restarting Apache"
+systemctl restart httpd.service
+
+echo "Writing openrc scripts"
+ADMINRC=$(cat <<EOF
+#!/bin/bash
+
+# To use an OpenStack cloud you need to authenticate against the Identity
+# service named keystone, which returns a **Token** and **Service Catalog**.
+# The catalog contains the endpoints for all services the user/tenant has
+# access to - such as Compute, Image Service, Identity, Object Storage, Block
+# Storage, and Networking (code-named nova, glance, keystone, swift,
+# cinder, and neutron).
+#
+# *NOTE*: Using the 2.0 *Identity API* does not necessarily mean any other
+# OpenStack API is version 2.0. For example, your cloud provider may implement
+# Image API v1.1, Block Storage API v2, and Compute API v2.0. OS_AUTH_URL is
+# only for the Identity API served through keystone.
+export OS_AUTH_URL=http://$CONTROLLER:5000/v3
+
+# With the addition of Keystone we have standardized on the term **tenant**
+# as the entity that owns the resources.
+#export OS_TENANT_ID=
+export OS_IDENTITY_API_VERSION=3
+export OS_PROJECT_DOMAIN_ID=default
+export OS_USER_DOMAIN_ID=default
+export OS_TENANT_NAME="admin"
+export OS_PROJECT_NAME="admin"
+
+# In addition to the owning entity (tenant), OpenStack stores the entity
+# performing the action as the **user**.
+export OS_USERNAME="admin"
+
+# With Keystone you pass the keystone password.
+#echo "Please enter your OpenStack Password: "
+#read -sr OS_PASSWORD_INPUT
+#export OS_PASSWORD=\$OS_PASSWORD_INPUT
+export OS_PASSWORD=$ADMIN_PASS
+
+# If your configuration has multiple regions, we set that information here.
+# OS_REGION_NAME is optional and only valid in certain environments.
+export OS_REGION_NAME="RegionOne"
+# Don't leave a blank variable, unset it if it was empty
+if [ -z "\$OS_REGION_NAME" ]; then unset OS_REGION_NAME; fi
+EOF
+)
+
+echo "$ADMINRC" > /root/admin-openrc.sh
+chmod 700 /root/admin-openrc.sh
+
+AUTORC=$(cat <<EOF
+#!/bin/bash
+
+# To use an OpenStack cloud you need to authenticate against the Identity
+# service named keystone, which returns a **Token** and **Service Catalog**.
+# The catalog contains the endpoints for all services the user/tenant has
+# access to - such as Compute, Image Service, Identity, Object Storage, Block
+# Storage, and Networking (code-named nova, glance, keystone, swift,
+# cinder, and neutron).
+#
+# *NOTE*: Using the 2.0 *Identity API* does not necessarily mean any other
+# OpenStack API is version 2.0. For example, your cloud provider may implement
+# Image API v1.1, Block Storage API v2, and Compute API v2.0. OS_AUTH_URL is
+# only for the Identity API served through keystone.
+export OS_AUTH_URL=http://$CONTROLLER:5000/v3
+
+# With the addition of Keystone we have standardized on the term **tenant**
+# as the entity that owns the resources.
+#export OS_TENANT_ID=
+export OS_IDENTITY_API_VERSION=3
+export OS_PROJECT_DOMAIN_ID=default
+export OS_USER_DOMAIN_ID=default
+export OS_TENANT_NAME="$AUTOMATION_PROJECT"
+export OS_PROJECT_NAME="$AUTOMATION_PROJECT"
+
+# In addition to the owning entity (tenant), OpenStack stores the entity
+# performing the action as the **user**.
+export OS_USERNAME="$AUTOMATION_USER"
+
+# With Keystone you pass the keystone password.
+#echo "Please enter your OpenStack Password: "
+#read -sr OS_PASSWORD_INPUT
+#export OS_PASSWORD=\$OS_PASSWORD_INPUT
+export OS_PASSWORD=$AUTOMATION_PASS
+
+# If your configuration has multiple regions, we set that information here.
+# OS_REGION_NAME is optional and only valid in certain environments.
+export OS_REGION_NAME="RegionOne"
+# Don't leave a blank variable, unset it if it was empty
+if [ -z "\$OS_REGION_NAME" ]; then unset OS_REGION_NAME; fi
+EOF
+)
+
+echo "$AUTORC" > /root/$AUTOMATION_USER-openrc.sh
+chmod 700 /root/$AUTOMATION_USER-openrc.sh
+
+echo "Deploying Images"
+
+export OS_PASSWORD=$ADMIN_PASS
+export OS_AUTH_URL=http://$CONTROLLER:35357/v3
+export OS_IDENTITY_API_VERSION=3
+export OS_PROJECT_DOMAIN_ID=default
+export OS_USER_DOMAIN_ID=default
+export OS_PROJECT_NAME=admin
+export OS_TENANT_NAME=admin
+export OS_USERNAME=admin
+
+for imagename in "${!IMAGES[@]}"; do
+    echo "Downloading Image: $imagename"
+    wget $IMAGEREPO/${IMAGES[$imagename]}
+
+    echo "Deploying Image: $imagename"
+    glance image-create --disk-format qcow2 --container-format bare --visibility public --name $imagename --file ${IMAGES[$imagename]} --min-disk=20 --progress
+done
+
+echo "Creating External Network"
+echo "command: neutron net-create public --shared --provider:physical_network public --provider:network_type flat --router:external"
+neutron net-create public --shared --provider:physical_network public --provider:network_type flat --router:external
+
+echo "Creating Subnet $PUBLIC_NETWORK"
+#echo "command: neutron subnet-create public $PUBLIC_NETWORK --name public --dns-nameserver $PUBLIC_NAMESERVER --gateway $PUBLIC_GATEWAY --disable-dhcp"
+#neutron subnet-create public $PUBLIC_NETWORK --name public --dns-nameserver $PUBLIC_NAMESERVER --gateway $PUBLIC_GATEWAY --disable-dhcp
+
+echo "command: neutron subnet-create public $PUBLIC_NETWORK --name public --dns-nameserver $PUBLIC_NAMESERVER --gateway $PUBLIC_GATEWAY"
+neutron subnet-create public $PUBLIC_NETWORK --name public --dns-nameserver $PUBLIC_NAMESERVER --gateway $PUBLIC_GATEWAY
+
+#echo "command: neutron subnet-create public $PUBLIC_NETWORK --name public --dns-nameserver $PUBLIC_NAMESERVER --gateway $PUBLIC_GATEWAY --allocation_pool start=$PUBLIC_IP_START,end=$PUBLIC_IP_END"
+#neutron subnet-create public $PUBLIC_NETWORK --name public --dns-nameserver $PUBLIC_NAMESERVER --gateway $PUBLIC_GATEWAY --allocation_pool start=$PUBLIC_IP_START,end=$PUBLIC_IP_END
+
+export OS_PASSWORD=$AUTOMATION_PASS
+export OS_AUTH_URL=http://$CONTROLLER:35357/v3
+export OS_IDENTITY_API_VERSION=3
+export OS_PROJECT_DOMAIN_ID=default
+export OS_USER_DOMAIN_ID=default
+export OS_PROJECT_NAME=build
+export OS_TENANT_NAME=build
+export OS_USERNAME=$AUTOMATION_USER
+
+echo "Creating Private Network"
+echo "command: neutron net-create private"
+neutron net-create private
+
+echo "Creating Private Subnet"
+echo "command: neutron subnet-create private $PRIVATE_NETWORK --name private --dns-nameserver $PUBLIC_NAMESERVER --gateway $PRIVATE_GATEWAY"
+neutron subnet-create private $PRIVATE_NETWORK --name private --dns-nameserver $PUBLIC_NAMESERVER --gateway $PRIVATE_GATEWAY
+
+echo "Creating Router for Private Network"
+echo "command: neutron router-create private-router"
+neutron router-create private-router
+
+echo "command: neutron router-interface-add private-router private "
+neutron router-interface-add private-router private
+
+#SUBNET_ID=$(neutron subnet-list | awk '/public/ {print $2}')
+
+echo "command: neutron router-gateway-set private-router public"
+neutron router-gateway-set private-router public
+
+#echo "command: neutron router-gateway-set private-router --fixed-ip subnet_id=$SUBNET_ID,ip_address=$PUBLIC_ROUTER_IP public"
+#neutron router-gateway-set private-router --fixed-ip subnet_id=$SUBNET_ID,ip_address=$PUBLIC_ROUTER_IP public
+
+echo "Creating Default Security Group (ACLs)"
+echo "command: nova secgroup-add-rule default icmp -1 -1 0.0.0.0/0"
+nova secgroup-add-rule default icmp -1 -1 0.0.0.0/0
+
+echo "command: nova secgroup-add-rule default tcp 22 22 0.0.0.0/0"
+nova secgroup-add-rule default tcp 22 22 0.0.0.0/0
+
+echo "OpenStack Setup Complete"
