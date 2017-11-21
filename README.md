@@ -12,7 +12,7 @@ OpenStack has a bunch of services that all have their own passwords, and the var
 Stackinit works very well on CentOS 7.  There's no reason why it can't work on RHEL or OEL if the repos contain the proper packages.
 
 ## boxinit.py
-Boxinit.py is a python script that will set up a remote host.  It has the yum repos OpenStack requires in it, and they're munged up to work within Apple Datacenters.
+Boxinit.py is a python script that will set up a remote host.  It has the yum repos OpenStack requires in it.
 
 ## Usage
 
